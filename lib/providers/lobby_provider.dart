@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
+import 'package:pocketbase/pocketbase.dart';
 import 'package:uuid/uuid.dart';
 import 'package:video_player/video_player.dart';
 import '../models/file_transfer_progress.dart';
@@ -35,6 +36,7 @@ class LobbyProvider extends ChangeNotifier {
   FileTransferProgress? _uploadProgress;
   FileTransferProgress? _downloadProgress;
   Timer? _progressTimer;
+  String? _currentLobbyId;
 
   final PocketBaseService _pocketBaseService = PocketBaseService();
 
@@ -54,6 +56,9 @@ class LobbyProvider extends ChangeNotifier {
 
   @override
   void dispose() {
+    if (_currentLobbyId != null) {
+      PocketBaseService.client.collection('lobbies').unsubscribe(_currentLobbyId!);
+    }
     _progressTimer?.cancel();
     _lobbySubscriptionTimer?.cancel();
     _participantsSubscriptionTimer?.cancel();
@@ -146,7 +151,7 @@ class LobbyProvider extends ChangeNotifier {
       _status = LobbyStatus.ready;
 
       // Setup polling for real-time updates
-      _setupLobbyPolling(record.id);
+      _setupLobbyRealTimeUpdates(record.id);
 
       notifyListeners();
       return true;
@@ -202,7 +207,7 @@ class LobbyProvider extends ChangeNotifier {
       _currentLobby = lobby.copyWith(participants: participants);
 
       // Setup polling
-      _setupLobbyPolling(lobbyId);
+      _setupLobbyRealTimeUpdates(lobbyId);
 
       // Handle video if exists
       if (_currentLobby?.videoUrl != null && !_isHost) {
@@ -725,18 +730,18 @@ class LobbyProvider extends ChangeNotifier {
   }
 
   // Setup polling for lobby updates (since PocketBase doesn't have built-in real-time subscriptions)
-  void _setupLobbyPolling(String lobbyId) {
+  void _setupLobbyRealTimeUpdates(String lobbyId) {
+    _currentLobbyId = lobbyId;
+    // Cancel any existing subscriptions
     _lobbySubscriptionTimer?.cancel();
     _participantsSubscriptionTimer?.cancel();
 
-    // Poll for lobby changes every 2 seconds
-    _lobbySubscriptionTimer = Timer.periodic(Duration(seconds: 2), (timer) async {
-      try {
-        final record = await PocketBaseService.client
-            .collection('lobbies')
-            .getOne(lobbyId);
-
-        final updatedLobby = LobbyModel.fromPocketBase(record);
+    // Subscribe to real-time changes on the lobby
+    PocketBaseService.client.collection('lobbies').subscribe(lobbyId, (event) {
+      // Now correctly handling RecordSubscriptionEvent
+      if (event.action == 'update' || event.action == 'create') {
+        final record = event.record; // This is already a RecordModel
+        final updatedLobby = LobbyModel.fromPocketBase(record!);
         final previousLobby = _currentLobby;
 
         // Keep current participants
@@ -748,9 +753,9 @@ class LobbyProvider extends ChangeNotifier {
           // Play/pause state changes
           if (previousLobby?.isPlaying != updatedLobby.isPlaying) {
             if (updatedLobby.isPlaying) {
-              await _videoController!.play();
+              _videoController!.play();
             } else {
-              await _videoController!.pause();
+              _videoController!.pause();
             }
           }
 
@@ -759,23 +764,13 @@ class LobbyProvider extends ChangeNotifier {
               previousLobby?.videoPosition != updatedLobby.videoPosition &&
               (previousLobby?.videoPosition == null ||
                   (updatedLobby.videoPosition - previousLobby!.videoPosition).abs() > 500)) {
-            await _videoController!.seekTo(
+            _videoController!.seekTo(
               Duration(milliseconds: updatedLobby.videoPosition),
             );
           }
         }
 
-        // New video detection
-        if (!_isHost &&
-            previousLobby?.videoUrl == null &&
-            updatedLobby.videoUrl != null) {
-          await _downloadVideo();
-        }
-
         notifyListeners();
-      } catch (e) {
-        print('Error polling lobby: $e');
-        // Don't update UI on polling errors
       }
     });
 
