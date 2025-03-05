@@ -1,4 +1,5 @@
-// lib/models/user_model.dart
+import 'package:pocketbase/pocketbase.dart';
+
 class UserModel {
   final String id;
   final String email;
@@ -12,12 +13,12 @@ class UserModel {
     this.isHost = false,
   });
 
-  factory UserModel.fromJson(Map<String, dynamic> json) {
+  factory UserModel.fromPocketBase(RecordModel record) {
     return UserModel(
-      id: json['id'],
-      email: json['email'],
-      username: json['username'],
-      isHost: json['is_host'] ?? false,
+      id: record.id,
+      email: record.data['email'] ?? '',
+      username: record.data['username'],
+      isHost: record.data['is_host'] ?? false,
     );
   }
 

@@ -1,8 +1,7 @@
-// lib/providers/auth_provider.dart
 import 'package:flutter/material.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:pocketbase/pocketbase.dart';
 import '../models/user_model.dart';
-import '../services/supabase_service.dart';
+import '../services/pocketbase_service.dart';
 
 enum AuthStatus {
   initial,
@@ -16,7 +15,7 @@ class AuthProvider extends ChangeNotifier {
   AuthStatus _status = AuthStatus.initial;
   UserModel? _user;
   String? _errorMessage;
-  final SupabaseService _supabaseService = SupabaseService();
+  final PocketBaseService _pocketBaseService = PocketBaseService();
 
   AuthStatus get status => _status;
   UserModel? get user => _user;
@@ -27,28 +26,18 @@ class AuthProvider extends ChangeNotifier {
   AuthProvider() {
     // Check if user is already authenticated
     _checkCurrentUser();
-
-    // Listen to auth state changes
-    SupabaseService.client.auth.onAuthStateChange.listen((data) {
-      final event = data.event;
-      final session = data.session;
-
-      if (event == AuthChangeEvent.signedIn && session != null) {
-        _getUserData(session.user.id);
-      } else if (event == AuthChangeEvent.signedOut) {
-        _user = null;
-        _status = AuthStatus.unauthenticated;
-        notifyListeners();
-      }
-    });
   }
 
   Future<void> _checkCurrentUser() async {
-    final session = SupabaseService.client.auth.currentSession;
-
-    if (session != null) {
-      await _getUserData(session.user.id);
-    } else {
+    try {
+      if (PocketBaseService.client.authStore.isValid) {
+        final userId = PocketBaseService.client.authStore.model.id;
+        await _getUserData(userId);
+      } else {
+        _status = AuthStatus.unauthenticated;
+        notifyListeners();
+      }
+    } catch (e) {
       _status = AuthStatus.unauthenticated;
       notifyListeners();
     }
@@ -56,13 +45,9 @@ class AuthProvider extends ChangeNotifier {
 
   Future<void> _getUserData(String userId) async {
     try {
-      final response = await SupabaseService.client
-          .from('profiles')
-          .select()
-          .eq('id', userId)
-          .single();
+      final record = await PocketBaseService.client.collection('users').getOne(userId);
 
-      _user = UserModel.fromJson(response);
+      _user = UserModel.fromPocketBase(record);
       _status = AuthStatus.authenticated;
       notifyListeners();
     } catch (e) {
@@ -77,13 +62,13 @@ class AuthProvider extends ChangeNotifier {
       _errorMessage = null;
       notifyListeners();
 
-      final response = await _supabaseService.signIn(
+      final response = await _pocketBaseService.signIn(
         email: email,
         password: password,
       );
 
-      if (response.session != null) {
-        await _getUserData(response.user!.id);
+      if (response.token.isNotEmpty) {
+        await _getUserData(response.record.id);
         return true;
       }
 
@@ -109,14 +94,14 @@ class AuthProvider extends ChangeNotifier {
       _errorMessage = null;
       notifyListeners();
 
-      final response = await _supabaseService.signUp(
+      final response = await _pocketBaseService.signUp(
         email: email,
         password: password,
         username: username,
       );
 
-      if (response.session != null) {
-        await _getUserData(response.user!.id);
+      if (response.token.isNotEmpty) {
+        await _getUserData(response.record.id);
         return true;
       }
 
@@ -134,7 +119,7 @@ class AuthProvider extends ChangeNotifier {
 
   Future<void> signOut() async {
     try {
-      await _supabaseService.signOut();
+      await _pocketBaseService.signOut();
       _user = null;
       _status = AuthStatus.unauthenticated;
       notifyListeners();

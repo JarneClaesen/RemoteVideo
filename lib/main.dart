@@ -1,25 +1,28 @@
-// lib/main.dart
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import 'package:synced_video/providers/lobby_provider.dart';
+import 'package:media_kit/media_kit.dart';
+import 'package:media_kit_video/media_kit_video.dart';
 import 'package:video_player_media_kit/video_player_media_kit.dart';
+import 'services/pocketbase_service.dart';
 import 'providers/auth_provider.dart';
-import 'screens/login_screen.dart';
-import 'screens/home_screen.dart';
-import 'services/supabase_service.dart';
+import 'providers/lobby_provider.dart';
+import 'screens/auth_wrapper.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Initialize Supabase
-  await SupabaseService.initialize();
+  // Initialize PocketBase
+  await PocketBaseService.initialize();
+
+  // Initialize video players
+  MediaKit.ensureInitialized();
   VideoPlayerMediaKit.ensureInitialized(
-    android: true,          // default: false    -    dependency: media_kit_libs_android_video
-    iOS: true,              // default: false    -    dependency: media_kit_libs_ios_video
-    macOS: true,            // default: false    -    dependency: media_kit_libs_macos_video
-    windows: true,          // default: false    -    dependency: media_kit_libs_windows_video
-    linux: true,
-    web: true
+      android: false,
+      iOS: false,
+      macOS: false,
+      windows: true,
+      linux: true,
+      web: false
   );
 
   runApp(const MyApp());
@@ -44,30 +47,5 @@ class MyApp extends StatelessWidget {
         home: const AuthWrapper(),
       ),
     );
-  }
-}
-
-class AuthWrapper extends StatelessWidget {
-  const AuthWrapper({Key? key}) : super(key: key);
-
-  @override
-  Widget build(BuildContext context) {
-    final authProvider = Provider.of<AuthProvider>(context);
-
-    switch (authProvider.status) {
-      case AuthStatus.authenticated:
-        return const HomeScreen();
-      case AuthStatus.unauthenticated:
-      case AuthStatus.error:
-        return const LoginScreen();
-      case AuthStatus.initial:
-      case AuthStatus.authenticating:
-      default:
-        return const Scaffold(
-          body: Center(
-            child: CircularProgressIndicator(),
-          ),
-        );
-    }
   }
 }

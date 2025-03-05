@@ -1,16 +1,16 @@
-// lib/providers/lobby_provider.dart
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
-import 'package:http/http.dart' as http;
 import 'package:uuid/uuid.dart';
 import 'package:video_player/video_player.dart';
 import '../models/file_transfer_progress.dart';
 import '../models/lobby_model.dart';
-import '../services/supabase_service.dart';
+import '../services/pocketbase_service.dart';
 
 enum LobbyStatus {
   initial,
@@ -30,13 +30,13 @@ class LobbyProvider extends ChangeNotifier {
   VideoPlayerController? _videoController;
   File? _localVideoFile;
   List<LobbyModel> _availableLobbies = [];
-  StreamSubscription? _lobbySubscription;
-  StreamSubscription? _participantsSubscription;
+  Timer? _lobbySubscriptionTimer;
+  Timer? _participantsSubscriptionTimer;
   FileTransferProgress? _uploadProgress;
   FileTransferProgress? _downloadProgress;
   Timer? _progressTimer;
 
-  final SupabaseService _supabaseService = SupabaseService();
+  final PocketBaseService _pocketBaseService = PocketBaseService();
 
   LobbyStatus get status => _status;
   LobbyModel? get currentLobby => _currentLobby;
@@ -55,9 +55,9 @@ class LobbyProvider extends ChangeNotifier {
   @override
   void dispose() {
     _progressTimer?.cancel();
+    _lobbySubscriptionTimer?.cancel();
+    _participantsSubscriptionTimer?.cancel();
     _videoController?.dispose();
-    _lobbySubscription?.cancel();
-    _participantsSubscription?.cancel();
     super.dispose();
   }
 
@@ -68,34 +68,29 @@ class LobbyProvider extends ChangeNotifier {
       _status = LobbyStatus.loading;
       notifyListeners();
 
-      // Remove the is_active filter that doesn't exist
-      print('Fetching lobbies from Supabase...');
-      final response = await SupabaseService.client
-          .from('lobbies')
-          .select()
-          .order('created_at', ascending: false);
-      print('Received ${(response as List).length} lobbies from database');
+      print('Fetching lobbies from PocketBase...');
+      final response = await PocketBaseService.client
+          .collection('lobbies')
+          .getList(sort: '-created');
 
-      List<LobbyModel> lobbies = (response)
-          .map((data) => LobbyModel.fromJson(data))
-          .toList();
-      print('Parsed ${lobbies.length} lobby models');
+      print('Received ${response.items.length} lobbies from database');
 
-      // For each lobby, fetch its participants
-      print('Fetching participants for each lobby...');
-      for (var i = 0; i < lobbies.length; i++) {
-        print('Fetching participants for lobby ID: ${lobbies[i].id}');
-        final participantsResponse = await SupabaseService.client
-            .from('lobby_participants')
-            .select('user_id')
-            .eq('lobby_id', lobbies[i].id);
+      List<LobbyModel> lobbies = [];
 
-        final participants = (participantsResponse as List)
-            .map((data) => data['user_id'] as String)
+      for (final item in response.items) {
+        // For each lobby, fetch its participants
+        print('Fetching participants for lobby ID: ${item.id}');
+        final participantsResponse = await PocketBaseService.client
+            .collection('lobby_participants')
+            .getList(filter: 'lobby_id="${item.id}"');
+
+        final participants = participantsResponse.items
+            .map((participantRecord) => participantRecord.data['user_id'] as String)
             .toList();
-        print('Found ${participants.length} participants for lobby ID: ${lobbies[i].id}');
 
-        lobbies[i] = lobbies[i].copyWith(participants: participants);
+        print('Found ${participants.length} participants for lobby ID: ${item.id}');
+
+        lobbies.add(LobbyModel.fromPocketBase(item, participants: participants));
       }
 
       _availableLobbies = lobbies;
@@ -119,42 +114,39 @@ class LobbyProvider extends ChangeNotifier {
       _status = LobbyStatus.loading;
       notifyListeners();
 
-      final String lobbyId = const Uuid().v4();
-      final now = DateTime.now();
-
-      // Create minimal lobby data matching database schema
-      await SupabaseService.client
-          .from('lobbies')
-          .insert({
-        'id': lobbyId,
+      // Create lobby in PocketBase
+      final lobbyData = {
         'name': name,
         'host_id': hostId,
-        // created_at and updated_at are handled by the database defaults
-      });
+        'video_position': 0,
+        'is_playing': false,
+      };
+
+      final record = await PocketBaseService.client
+          .collection('lobbies')
+          .create(body: lobbyData);
 
       // Add host as participant
-      await SupabaseService.client
-          .from('lobby_participants')
-          .insert({
-        'lobby_id': lobbyId,
+      final participantData = {
+        'lobby_id': record.id,
         'user_id': hostId,
-      });
+      };
+
+      await PocketBaseService.client
+          .collection('lobby_participants')
+          .create(body: participantData);
 
       // Create local model
-      _currentLobby = LobbyModel(
-        id: lobbyId,
-        name: name,
-        hostId: hostId,
-        createdAt: now,
-        updatedAt: now,
+      _currentLobby = LobbyModel.fromPocketBase(
+        record,
         participants: [hostId],
       );
 
       _isHost = true;
       _status = LobbyStatus.ready;
 
-      // Setup real-time updates
-      _setupLobbySubscription(lobbyId);
+      // Setup polling for real-time updates
+      _setupLobbyPolling(record.id);
 
       notifyListeners();
       return true;
@@ -176,41 +168,41 @@ class LobbyProvider extends ChangeNotifier {
       notifyListeners();
 
       // Get lobby details
-      final response = await SupabaseService.client
-          .from('lobbies')
-          .select()
-          .eq('id', lobbyId)
-          .single();
+      final record = await PocketBaseService.client
+          .collection('lobbies')
+          .getOne(lobbyId);
 
       // Get participants
-      final participantsResponse = await SupabaseService.client
-          .from('lobby_participants')
-          .select('user_id')
-          .eq('lobby_id', lobbyId);
+      final participantsResponse = await PocketBaseService.client
+          .collection('lobby_participants')
+          .getList(filter: 'lobby_id="$lobbyId"');
 
-      final participants = (participantsResponse as List)
-          .map((data) => data['user_id'] as String)
+      final participants = participantsResponse.items
+          .map((participantRecord) => participantRecord.data['user_id'] as String)
           .toList();
 
       // Check if user is host
-      final lobby = LobbyModel.fromJson(response);
+      final lobby = LobbyModel.fromPocketBase(record, participants: participants);
       _isHost = lobby.hostId == userId;
 
       // Add user as participant if not already
       if (!participants.contains(userId)) {
-        await SupabaseService.client
-            .from('lobby_participants')
-            .insert({
+        final participantData = {
           'lobby_id': lobbyId,
           'user_id': userId,
-        });
+        };
+
+        await PocketBaseService.client
+            .collection('lobby_participants')
+            .create(body: participantData);
+
         participants.add(userId);
       }
 
       _currentLobby = lobby.copyWith(participants: participants);
 
-      // Setup subscriptions
-      _setupLobbySubscription(lobbyId);
+      // Setup polling
+      _setupLobbyPolling(lobbyId);
 
       // Handle video if exists
       if (_currentLobby?.videoUrl != null && !_isHost) {
@@ -234,24 +226,30 @@ class LobbyProvider extends ChangeNotifier {
     try {
       if (_currentLobby == null) return true;
 
-      // Remove from participants table
-      await SupabaseService.client
-          .from('lobby_participants')
-          .delete()
-          .eq('lobby_id', _currentLobby!.id)
-          .eq('user_id', userId);
+      // Find and remove from participants table
+      final participantsResponse = await PocketBaseService.client
+          .collection('lobby_participants')
+          .getList(
+        filter: 'lobby_id="${_currentLobby!.id}" && user_id="$userId"',
+      );
+
+      if (participantsResponse.items.isNotEmpty) {
+        final participantId = participantsResponse.items.first.id;
+        await PocketBaseService.client
+            .collection('lobby_participants')
+            .delete(participantId);
+      }
 
       // If host, delete lobby
       if (_isHost) {
-        await SupabaseService.client
-            .from('lobbies')
-            .delete()
-            .eq('id', _currentLobby!.id);
+        await PocketBaseService.client
+            .collection('lobbies')
+            .delete(_currentLobby!.id);
       }
 
       // Clean up resources
-      _lobbySubscription?.cancel();
-      _participantsSubscription?.cancel();
+      _lobbySubscriptionTimer?.cancel();
+      _participantsSubscriptionTimer?.cancel();
       _videoController?.dispose();
       _videoController = null;
       _localVideoFile = null;
@@ -305,7 +303,6 @@ class LobbyProvider extends ChangeNotifier {
         simulatedBytesUploaded += bytesPerTick;
         if (simulatedBytesUploaded > fileSize) {
           simulatedBytesUploaded = fileSize;
-          // Don't cancel yet - wait for actual upload to complete
         }
 
         // Calculate actual speed based on time difference
@@ -329,35 +326,53 @@ class LobbyProvider extends ChangeNotifier {
       });
 
       // Start the actual upload
-      final fileName = '${_currentLobby!.id}_${path.basename(videoFile.path)}';
+      final baseName = path.basename(videoFile.path);
+      final fileName = '${_currentLobby!.id}_$baseName';
       final stopwatch = Stopwatch()..start();
 
       try {
-        // Perform the actual upload
-        await SupabaseService.client
-            .storage
-            .from('videos')
-            .upload(fileName, videoFile);
+        // Prepare form data for creating the record
+        final formData = {
+          'lobby_id': _currentLobby!.id,
+          'filename': fileName,
+        };
 
-        // Get the public URL
-        final videoUrl = SupabaseService.client
-            .storage
-            .from('videos')
-            .getPublicUrl(fileName);
+        // Use the PocketBase SDK to create a record with the file
+        final record = await PocketBaseService.client
+            .collection('videos')
+            .create(
+          body: formData,
+          files: [
+            await http.MultipartFile.fromPath('video', videoFile.path, filename: fileName),
+          ],
+        );
+
+        // Get the video record ID
+        final videoRecordId = record.id;
+
+        // Extract the actual filename from the record data
+        // The field name might be 'video', change it according to your schema
+        final Map<String, dynamic> videoData = record.data;
+
+        // This is the critical part - get the actual stored filename
+        // The field name 'video' should be the name of the file field in your PocketBase collection
+        final String actualFileName = videoData['video'];
+
+        // Construct the proper URL manually
+        final videoUrl = '${PocketBaseService.baseUrl}/api/files/videos/$videoRecordId/$actualFileName';
 
         // Update the lobby with the video URL
-        await SupabaseService.client
-            .from('lobbies')
-            .update({
+        await PocketBaseService.client
+            .collection('lobbies')
+            .update(_currentLobby!.id, body: {
           'video_url': videoUrl,
-          'video_file_name': fileName,
-        })
-            .eq('id', _currentLobby!.id);
+          'video_file_name': actualFileName,
+        });
 
         // Update local state
         _currentLobby = _currentLobby!.copyWith(
           videoUrl: videoUrl,
-          videoFileName: fileName,
+          videoFileName: actualFileName,
         );
 
         // Set up video player with the local file
@@ -392,6 +407,7 @@ class LobbyProvider extends ChangeNotifier {
     }
   }
 
+
   // Download the video for participants
   Future<void> _downloadVideo() async {
     if (_currentLobby?.videoUrl == null) {
@@ -418,7 +434,6 @@ class LobbyProvider extends ChangeNotifier {
         if (fileSize < 1024) {
           print('File too small, deleting and re-downloading');
           await file.delete();
-          // Continue with download code
         } else {
           _localVideoFile = file;
           print('Initializing video player with existing file');
@@ -440,33 +455,70 @@ class LobbyProvider extends ChangeNotifier {
 
       try {
         final stopwatch = Stopwatch()..start();
-        print('Downloading video from Supabase');
+        print('Downloading video from PocketBase');
 
-        // Extract just the filename from the video URL
-        final String? fileName = _currentLobby!.videoFileName;
-        print('Downloading file: $fileName from "videos" bucket');
+        // Get the original video URL
+        String videoUrl = _currentLobby!.videoUrl!;
+
+        // Modify URL for Android emulator if needed
+        if (Platform.isAndroid) {
+          // Parse the original URL
+          final uri = Uri.parse(videoUrl);
+
+          // Check if it's a localhost URL
+          if (uri.host == 'localhost' || uri.host == '127.0.0.1') {
+            // Create a new URL with 10.0.2.2 instead of localhost
+            final newUri = Uri(
+              scheme: uri.scheme,
+              host: '10.0.2.2',
+              port: uri.port,
+              path: uri.path,
+              query: uri.query,
+              fragment: uri.fragment,
+            );
+            videoUrl = newUri.toString();
+            print('Android detected, modified URL to: $videoUrl');
+          }
+        }
+
+        if (Platform.isWindows) {
+          // Parse the original URL
+          final uri = Uri.parse(videoUrl);
+
+          // Check if the URL is pointing to the Windows host (10.0.2.2)
+          if (uri.host == '10.0.2.2') {
+            // Create a new URL with localhost/127.0.0.1 instead
+            final newUri = Uri(
+              scheme: uri.scheme,
+              host: '127.0.0.1',  // or 'localhost'
+              port: uri.port,
+              path: uri.path,
+              query: uri.query,
+              fragment: uri.fragment,
+            );
+            videoUrl = newUri.toString();
+            print('Android detected, modified URL to: $videoUrl');
+          }
+        }
 
         // Try to get file size via HEAD request first
         int? totalSize;
         try {
-          final downloadUrl = _currentLobby!.videoUrl;
-          if (downloadUrl != null) {
-            final headResponse = await http.head(Uri.parse(downloadUrl));
-            if (headResponse.statusCode == 200) {
-              final contentLength = headResponse.headers['content-length'];
-              if (contentLength != null) {
-                totalSize = int.parse(contentLength);
-                print('File size from HEAD request: $totalSize bytes');
+          final headResponse = await http.head(Uri.parse(videoUrl));
+          if (headResponse.statusCode == 200) {
+            final contentLength = headResponse.headers['content-length'];
+            if (contentLength != null) {
+              totalSize = int.parse(contentLength);
+              print('File size from HEAD request: $totalSize bytes');
 
-                // Update progress with total size
-                _downloadProgress = FileTransferProgress(
-                  bytesTransferred: 0,
-                  totalBytes: totalSize,
-                  speed: 0,
-                  lastUpdated: DateTime.now(),
-                );
-                notifyListeners();
-              }
+              // Update progress with total size
+              _downloadProgress = FileTransferProgress(
+                bytesTransferred: 0,
+                totalBytes: totalSize,
+                speed: 0,
+                lastUpdated: DateTime.now(),
+              );
+              notifyListeners();
             }
           }
         } catch (e) {
@@ -474,7 +526,7 @@ class LobbyProvider extends ChangeNotifier {
           // Continue without size
         }
 
-        // Use an estimated size if not available (50MB is a reasonable video size)
+        // Use an estimated size if not available
         totalSize ??= 50 * 1024 * 1024;
 
         // Set up progress simulation
@@ -518,10 +570,8 @@ class LobbyProvider extends ChangeNotifier {
         });
 
         // Perform the actual download
-        final bytes = await SupabaseService.client
-            .storage
-            .from('videos')
-            .download(fileName!);
+        final response = await http.get(Uri.parse(videoUrl));
+        final bytes = response.bodyBytes;
 
         // Cancel the progress timer
         _progressTimer?.cancel();
@@ -572,6 +622,11 @@ class LobbyProvider extends ChangeNotifier {
     try {
       await _videoController?.dispose();
 
+      // In _initializeVideoPlayer method
+      print('Video file path: $filePath');
+      print('File exists: ${File(filePath).existsSync()}');
+      print('File size: ${File(filePath).lengthSync()} bytes');
+
       // Create the controller
       _videoController = VideoPlayerController.file(File(filePath));
 
@@ -590,7 +645,6 @@ class LobbyProvider extends ChangeNotifier {
     }
   }
 
-
   // Play the video (host only)
   Future<void> playVideo() async {
     if (!_isHost || _videoController == null || _currentLobby == null) return;
@@ -599,13 +653,12 @@ class LobbyProvider extends ChangeNotifier {
       await _videoController!.play();
 
       // Update the lobby state
-      await SupabaseService.client
-          .from('lobbies')
-          .update({
+      await PocketBaseService.client
+          .collection('lobbies')
+          .update(_currentLobby!.id, body: {
         'is_playing': true,
         'video_position': _videoController!.value.position.inMilliseconds,
-      })
-          .eq('id', _currentLobby!.id);
+      });
 
       _currentLobby = _currentLobby!.copyWith(
         isPlaying: true,
@@ -627,13 +680,12 @@ class LobbyProvider extends ChangeNotifier {
       await _videoController!.pause();
 
       // Update the lobby state
-      await SupabaseService.client
-          .from('lobbies')
-          .update({
+      await PocketBaseService.client
+          .collection('lobbies')
+          .update(_currentLobby!.id, body: {
         'is_playing': false,
         'video_position': _videoController!.value.position.inMilliseconds,
-      })
-          .eq('id', _currentLobby!.id);
+      });
 
       _currentLobby = _currentLobby!.copyWith(
         isPlaying: false,
@@ -655,12 +707,11 @@ class LobbyProvider extends ChangeNotifier {
       await _videoController!.seekTo(position);
 
       // Update the lobby state
-      await SupabaseService.client
-          .from('lobbies')
-          .update({
+      await PocketBaseService.client
+          .collection('lobbies')
+          .update(_currentLobby!.id, body: {
         'video_position': position.inMilliseconds,
-      })
-          .eq('id', _currentLobby!.id);
+      });
 
       _currentLobby = _currentLobby!.copyWith(
         videoPosition: position.inMilliseconds,
@@ -673,69 +724,80 @@ class LobbyProvider extends ChangeNotifier {
     }
   }
 
-  // Setup real-time subscription to lobby updates
-  void _setupLobbySubscription(String lobbyId) {
-    _lobbySubscription?.cancel();
-    _participantsSubscription?.cancel();
+  // Setup polling for lobby updates (since PocketBase doesn't have built-in real-time subscriptions)
+  void _setupLobbyPolling(String lobbyId) {
+    _lobbySubscriptionTimer?.cancel();
+    _participantsSubscriptionTimer?.cancel();
 
-    // Subscribe to lobby changes
-    _lobbySubscription = SupabaseService.client
-        .from('lobbies')
-        .stream(primaryKey: ['id'])
-        .eq('id', lobbyId)
-        .listen((data) async {
-      if (data.isEmpty) return;
+    // Poll for lobby changes every 2 seconds
+    _lobbySubscriptionTimer = Timer.periodic(Duration(seconds: 2), (timer) async {
+      try {
+        final record = await PocketBaseService.client
+            .collection('lobbies')
+            .getOne(lobbyId);
 
-      final updatedLobby = LobbyModel.fromJson(data.first);
-      final previousLobby = _currentLobby;
+        final updatedLobby = LobbyModel.fromPocketBase(record);
+        final previousLobby = _currentLobby;
 
-      // Keep current participants
-      final currentParticipants = _currentLobby?.participants ?? [];
-      _currentLobby = updatedLobby.copyWith(participants: currentParticipants);
+        // Keep current participants
+        final currentParticipants = _currentLobby?.participants ?? [];
+        _currentLobby = updatedLobby.copyWith(participants: currentParticipants);
 
-      // Handle video controller updates
-      if (_videoController != null) {
-        // Play/pause state changes
-        if (previousLobby?.isPlaying != updatedLobby.isPlaying) {
-          if (updatedLobby.isPlaying) {
-            await _videoController!.play();
-          } else {
-            await _videoController!.pause();
+        // Handle video controller updates
+        if (_videoController != null) {
+          // Play/pause state changes
+          if (previousLobby?.isPlaying != updatedLobby.isPlaying) {
+            if (updatedLobby.isPlaying) {
+              await _videoController!.play();
+            } else {
+              await _videoController!.pause();
+            }
+          }
+
+          // Position changes for non-hosts
+          if (!_isHost &&
+              previousLobby?.videoPosition != updatedLobby.videoPosition &&
+              (previousLobby?.videoPosition == null ||
+                  (updatedLobby.videoPosition - previousLobby!.videoPosition).abs() > 500)) {
+            await _videoController!.seekTo(
+              Duration(milliseconds: updatedLobby.videoPosition),
+            );
           }
         }
 
-        // Position changes for non-hosts
+        // New video detection
         if (!_isHost &&
-            previousLobby?.videoPosition != updatedLobby.videoPosition &&
-            (previousLobby?.videoPosition == null ||
-                (updatedLobby.videoPosition - previousLobby!.videoPosition).abs() > 500)) {
-          await _videoController!.seekTo(
-            Duration(milliseconds: updatedLobby.videoPosition),
-          );
+            previousLobby?.videoUrl == null &&
+            updatedLobby.videoUrl != null) {
+          await _downloadVideo();
         }
-      }
 
-      // New video detection
-      if (!_isHost &&
-          previousLobby?.videoUrl == null &&
-          updatedLobby.videoUrl != null) {
-        await _downloadVideo();
+        notifyListeners();
+      } catch (e) {
+        print('Error polling lobby: $e');
+        // Don't update UI on polling errors
       }
-
-      notifyListeners();
     });
 
-    // Add subscription for participants
-    _participantsSubscription = SupabaseService.client
-        .from('lobby_participants')
-        .stream(primaryKey: ['id'])
-        .eq('lobby_id', lobbyId)
-        .listen((data) async {
-      if (_currentLobby == null) return;
+    // Poll for participants every 5 seconds
+    _participantsSubscriptionTimer = Timer.periodic(Duration(seconds: 5), (timer) async {
+      try {
+        if (_currentLobby == null) return;
 
-      final participants = data.map((item) => item['user_id'] as String).toList();
-      _currentLobby = _currentLobby!.copyWith(participants: participants);
-      notifyListeners();
+        final participantsResponse = await PocketBaseService.client
+            .collection('lobby_participants')
+            .getList(filter: 'lobby_id="$lobbyId"');
+
+        final participants = participantsResponse.items
+            .map((record) => record.data['user_id'] as String)
+            .toList();
+
+        _currentLobby = _currentLobby!.copyWith(participants: participants);
+        notifyListeners();
+      } catch (e) {
+        print('Error polling participants: $e');
+        // Don't update UI on polling errors
+      }
     });
   }
 }

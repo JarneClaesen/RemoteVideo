@@ -1,5 +1,3 @@
-import 'dart:math' as math;
-
 class FileTransferProgress {
   final int bytesTransferred;
   final int? totalBytes;

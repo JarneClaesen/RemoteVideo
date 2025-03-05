@@ -8,7 +8,6 @@ import 'package:video_player/video_player.dart';
 import '../models/file_transfer_progress.dart';
 import '../providers/auth_provider.dart';
 import '../providers/lobby_provider.dart';
-import '../services/supabase_service.dart';
 
 class LobbyScreen extends StatefulWidget {
   final String lobbyId;

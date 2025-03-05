@@ -1,14 +1,16 @@
+import 'package:pocketbase/pocketbase.dart';
+
 class LobbyModel {
   final String id;
   final String name;
   final String hostId;
   final String? videoUrl;
   final String? videoFileName;
-  final int videoPosition; // renamed from currentPosition
+  final int videoPosition;
   final bool isPlaying;
-  final DateTime createdAt;
-  final DateTime updatedAt;
-  final List<String> participants; // Will be populated separately
+  final String createdAt;
+  final String updatedAt;
+  final List<String> participants;
 
   LobbyModel({
     required this.id,
@@ -23,37 +25,32 @@ class LobbyModel {
     this.participants = const [],
   });
 
-  factory LobbyModel.fromJson(Map<String, dynamic> json) {
+  factory LobbyModel.fromPocketBase(RecordModel record, {List<String> participants = const []}) {
     return LobbyModel(
-      id: json['id'],
-      name: json['name'],
-      hostId: json['host_id'],
-      videoUrl: json['video_url'],
-      videoFileName: json['video_file_name'],
-      videoPosition: json['video_position'] ?? 0,
-      isPlaying: json['is_playing'] ?? false,
-      createdAt: DateTime.parse(json['created_at']),
-      updatedAt: DateTime.parse(json['updated_at']),
-      participants: json['participants'] != null
-          ? List<String>.from(json['participants'])
-          : [],
+      id: record.id,
+      name: record.data['name'] ?? '',
+      hostId: record.data['host_id'] ?? '',
+      videoUrl: record.data['video_url'],
+      videoFileName: record.data['video_file_name'],
+      videoPosition: record.data['video_position'] ?? 0,
+      isPlaying: record.data['is_playing'] ?? false,
+      createdAt: record.created,
+      updatedAt: record.updated,
+      participants: participants,
     );
   }
 
   Map<String, dynamic> toJson() {
     return {
-      'id': id,
       'name': name,
       'host_id': hostId,
       'video_url': videoUrl,
       'video_file_name': videoFileName,
       'video_position': videoPosition,
       'is_playing': isPlaying,
-      // Don't include timestamps or participants when inserting
     };
   }
 
-  // Update copyWith method to match new fields
   LobbyModel copyWith({
     String? id,
     String? name,
@@ -62,8 +59,8 @@ class LobbyModel {
     String? videoFileName,
     int? videoPosition,
     bool? isPlaying,
-    DateTime? createdAt,
-    DateTime? updatedAt,
+    String? createdAt,
+    String? updatedAt,
     List<String>? participants,
   }) {
     return LobbyModel(
