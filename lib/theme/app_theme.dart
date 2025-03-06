@@ -25,6 +25,7 @@ class AppTheme {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(12),
           ),
+          iconColor: lightColorScheme.onPrimary,
         ),
       ),
       inputDecorationTheme: InputDecorationTheme(
@@ -106,6 +107,7 @@ class AppTheme {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(12),
           ),
+          iconColor: darkColorScheme.onPrimary,
         ),
       ),
       inputDecorationTheme: InputDecorationTheme(

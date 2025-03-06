@@ -143,6 +143,7 @@ class _LobbyScreenState extends State<LobbyScreen> {
         return true;
       },
       child: Scaffold(
+        backgroundColor: Colors.black,
         appBar: AppBar(
           title: Consumer<LobbyProvider>(
             builder: (context, provider, _) {
@@ -321,15 +322,8 @@ class _LobbyScreenState extends State<LobbyScreen> {
     return Container(
       padding: const EdgeInsets.all(16.0),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(8),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.1),
-            blurRadius: 4,
-            offset: const Offset(0, 2),
-          ),
-        ],
+        borderRadius: BorderRadius.circular(12),
+        color: Theme.of(context).colorScheme.surfaceContainerLow,
       ),
       width: double.infinity,
       child: Column(
@@ -347,8 +341,8 @@ class _LobbyScreenState extends State<LobbyScreen> {
           LinearProgressIndicator(
             value: progress.totalBytes != null ? progress.progress : null,
             minHeight: 10,
-            backgroundColor: Colors.grey[200],
-            valueColor: AlwaysStoppedAnimation<Color>(Colors.blue),
+            borderRadius: BorderRadius.circular(3),
+            valueColor: AlwaysStoppedAnimation<Color>(Theme.of(context).colorScheme.primary),
           ),
           const SizedBox(height: 12),
           Row(
@@ -362,7 +356,6 @@ class _LobbyScreenState extends State<LobbyScreen> {
                 progress.formattedSpeed,
                 style: const TextStyle(
                   fontWeight: FontWeight.w500,
-                  color: Colors.blue,
                 ),
               ),
             ],
@@ -373,7 +366,6 @@ class _LobbyScreenState extends State<LobbyScreen> {
               child: Text(
                 '${progress.formattedProgress} complete',
                 style: TextStyle(
-                  color: Colors.grey[600],
                   fontSize: 12,
                 ),
               ),
@@ -393,7 +385,6 @@ class _LobbyScreenState extends State<LobbyScreen> {
           child: Text(
             provider.currentLobby?.videoFileName ?? 'Video',
             style: const TextStyle(
-              color: Colors.white,
               fontSize: 16,
               fontWeight: FontWeight.bold,
             ),
@@ -406,7 +397,6 @@ class _LobbyScreenState extends State<LobbyScreen> {
                 ? Icons.pause_circle_filled
                 : Icons.play_circle_filled,
             size: 60,
-            color: Colors.white,
           ),
           onPressed: provider.isHost
               ? () {
@@ -426,7 +416,6 @@ class _LobbyScreenState extends State<LobbyScreen> {
             children: [
               Text(
                 _formatDuration(provider.videoController!.value.position),
-                style: const TextStyle(color: Colors.white),
               ),
               Expanded(
                 child: Slider(
@@ -455,7 +444,7 @@ class _LobbyScreenState extends State<LobbyScreen> {
               ),
               Text(
                 _formatDuration(provider.videoController!.value.duration),
-                style: const TextStyle(color: Colors.white),
+                style: TextStyle(color: Theme.of(context).colorScheme.onSurface),
               ),
             ],
           ),
@@ -466,8 +455,8 @@ class _LobbyScreenState extends State<LobbyScreen> {
 
   Widget _buildBottomControls(LobbyProvider provider) {
     return Container(
+      color: Theme.of(context).colorScheme.surfaceDim,
       padding: const EdgeInsets.all(8.0),
-      color: Colors.grey[200],
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceEvenly,
         children: [
