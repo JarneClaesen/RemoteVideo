@@ -48,6 +48,7 @@ dependencies:
   media_kit_libs_macos_video: any
   media_kit_libs_windows_video: any
   pocketbase: ^0.22.0
+  flutter_secure_storage: ^9.2.4
 
 dev_dependencies:
   flutter_test:
