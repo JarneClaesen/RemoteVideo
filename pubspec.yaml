@@ -50,6 +50,7 @@ dependencies:
   pocketbase: ^0.22.0
   flutter_secure_storage: ^9.2.4
   dio: ^5.8.0+1
+  http_parser: ^4.1.2
 
 dev_dependencies:
   flutter_test:

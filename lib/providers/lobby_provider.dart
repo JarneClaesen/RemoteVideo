@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as path;
@@ -13,6 +14,7 @@ import '../models/file_transfer_progress.dart';
 import '../models/lobby_model.dart';
 import '../services/pocketbase_service.dart';
 import 'package:dio/dio.dart' as dio;
+import 'package:http_parser/http_parser.dart';
 
 enum LobbyStatus {
   initial,
@@ -38,6 +40,9 @@ class LobbyProvider extends ChangeNotifier {
   FileTransferProgress? _downloadProgress;
   Timer? _progressTimer;
   String? _currentLobbyId;
+
+  // Chunking configuration
+  static const int _chunkSize = 50 * 1024 * 1024; //50MB chunks
 
   final PocketBaseService _pocketBaseService = PocketBaseService();
 
@@ -272,7 +277,7 @@ class LobbyProvider extends ChangeNotifier {
     }
   }
 
-  // Upload a video (host only)
+  // Upload a video (host only) - CHUNKED implementation
   Future<bool> uploadVideo(File videoFile) async {
     if (!_isHost || _currentLobby == null) return false;
 
@@ -292,109 +297,134 @@ class LobbyProvider extends ChangeNotifier {
       final baseName = path.basename(videoFile.path);
       final fileName = '${_currentLobby!.id}_$baseName';
 
-      // Create PocketBase FormData
-      final formData = dio.FormData.fromMap({
-        'lobby_id': _currentLobby!.id,
-        'filename': fileName,
-      });
+      // Read the file into memory and split into chunks
+      final fileBytes = await videoFile.readAsBytes();
+      final totalChunks = (fileSize / _chunkSize).ceil();
 
-      // Add the file with progress tracking
-      final file = await dio.MultipartFile.fromFile(
-        videoFile.path,
-        filename: fileName,
-      );
-      formData.files.add(MapEntry('video', file));
-
-      // For speed calculation
+      // Initialize tracking variables
+      int totalBytesUploaded = 0;
       final stopwatch = Stopwatch()..start();
-      int initialBytes = 0;
       int lastBytes = 0;
       DateTime lastUpdateTime = DateTime.now();
       double averageSpeed = 0;
-      const speedSmoothingFactor = 0.3; // For exponential moving average
+      const speedSmoothingFactor = 0.3;
 
-      // Use Dio for upload with onSendProgress callback
-      final response = await dio.Dio().post(
-        '${PocketBaseService.baseUrl}/api/collections/videos/records',
-        data: formData,
-        options: dio.Options(
-          headers: {
-            'Authorization': 'Bearer ${PocketBaseService.client.authStore.token}',
-          },
-        ),
-        onSendProgress: (int sent, int total) {
-          final now = DateTime.now();
+      // First create the metadata record to get a record ID
+      final metadataBody = {
+        'lobby_id': _currentLobby!.id,
+        'filename': fileName,
+        'total_chunks': totalChunks,
+        'filesize': fileSize,
+      };
 
-          // Calculate instantaneous speed
-          final timeDiffSeconds = now.difference(lastUpdateTime).inMilliseconds / 1000.0;
-          final bytesSinceLast = sent - lastBytes;
+      final metadataResponse = await PocketBaseService.client
+          .collection('videos')
+          .create(body: metadataBody);
 
-          // Only update speed if enough time has passed (avoid division by very small numbers)
-          if (timeDiffSeconds >= 0.1 && bytesSinceLast > 0) {
-            final instantSpeed = bytesSinceLast / timeDiffSeconds;
+      final videoRecordId = metadataResponse.id;
 
-            // Exponential moving average for smoother speed
-            averageSpeed = averageSpeed == 0
-                ? instantSpeed
-                : averageSpeed * (1 - speedSmoothingFactor) + instantSpeed * speedSmoothingFactor;
+      // Upload each chunk
+      for (int i = 0; i < totalChunks; i++) {
+        final start = i * _chunkSize;
+        final end = math.min((i + 1) * _chunkSize, fileSize);
+        final chunkSize = end - start;
 
-            lastBytes = sent;
-            lastUpdateTime = now;
-          }
+        // Extract this chunk from the file bytes
+        final chunkBytes = fileBytes.sublist(start, end);
 
-          // If too much time passes without progress, calculate using overall average
-          if (now.difference(lastUpdateTime).inSeconds > 3 && sent > initialBytes) {
-            final totalElapsedSeconds = stopwatch.elapsedMilliseconds / 1000.0;
-            if (totalElapsedSeconds > 0) {
-              averageSpeed = (sent - initialBytes) / totalElapsedSeconds;
-            }
-          }
-
-          // Update progress state
-          _uploadProgress = FileTransferProgress(
-            bytesTransferred: sent,
-            totalBytes: total,
-            speed: averageSpeed.isNaN || averageSpeed.isInfinite ? 0 : averageSpeed,
-            lastUpdated: now,
-          );
-
-          notifyListeners();
-        },
-      );
-
-      if (response.statusCode == 200 || response.statusCode == 201) {
-        final record = response.data;
-        final videoRecordId = record['id'];
-        final actualFileName = record['video'];
-
-        // Construct the video URL
-        final videoUrl = '${PocketBaseService.baseUrl}/api/files/videos/$videoRecordId/$actualFileName';
-
-        // Update the lobby with the video URL
-        await PocketBaseService.client
-            .collection('lobbies')
-            .update(_currentLobby!.id, body: {
-          'video_url': videoUrl,
-          'video_file_name': actualFileName,
+        // Create FormData for this chunk
+        final formData = dio.FormData.fromMap({
+          'record_id': videoRecordId,
+          'chunk_index': i,
+          'total_chunks': totalChunks,
         });
 
-        // Update local state
-        _currentLobby = _currentLobby!.copyWith(
-          videoUrl: videoUrl,
-          videoFileName: actualFileName,
+        // Add the chunk file
+        final chunkFileName = '${fileName}_part_$i';
+        formData.files.add(
+          MapEntry(
+            'chunk',
+            dio.MultipartFile.fromBytes(
+              chunkBytes,
+              filename: chunkFileName,
+              contentType: MediaType('application', 'octet-stream'),
+            ),
+          ),
         );
 
-        // Set up video player with the local file
-        _localVideoFile = videoFile;
-        await _initializeVideoPlayer(videoFile.path);
+        // Upload the chunk
+        final response = await dio.Dio().post(
+          '${PocketBaseService.baseUrl}/api/collections/video_chunks/records',
+          data: formData,
+          options: dio.Options(
+            headers: {
+              'Authorization': 'Bearer ${PocketBaseService.client.authStore.token}',
+            },
+          ),
+        );
 
-        _status = LobbyStatus.videoReady;
+        if (response.statusCode != 200 && response.statusCode != 201) {
+          throw Exception('Failed to upload chunk $i: HTTP ${response.statusCode}');
+        }
+
+        // Update progress
+        totalBytesUploaded += chunkSize;
+        final now = DateTime.now();
+
+        // Calculate speed
+        final timeDiffSeconds = now.difference(lastUpdateTime).inMilliseconds / 1000.0;
+        final bytesSinceLast = totalBytesUploaded - lastBytes;
+
+        if (timeDiffSeconds >= 0.1 && bytesSinceLast > 0) {
+          final instantSpeed = bytesSinceLast / timeDiffSeconds;
+          averageSpeed = averageSpeed == 0
+              ? instantSpeed
+              : averageSpeed * (1 - speedSmoothingFactor) + instantSpeed * speedSmoothingFactor;
+
+          lastBytes = totalBytesUploaded;
+          lastUpdateTime = now;
+        }
+
+        // Update progress state
+        _uploadProgress = FileTransferProgress(
+          bytesTransferred: totalBytesUploaded,
+          totalBytes: fileSize,
+          speed: averageSpeed.isNaN || averageSpeed.isInfinite ? 0 : averageSpeed,
+          lastUpdated: now,
+        );
+
         notifyListeners();
-        return true;
-      } else {
-        throw Exception('Failed to upload: HTTP ${response.statusCode}');
       }
 
+      // Mark upload as complete
+      await PocketBaseService.client
+          .collection('videos')
+          .update(videoRecordId, body: {'upload_completed': true});
+
+      // Construct the video URL for use in the lobby
+      final videoUrl = '${PocketBaseService.baseUrl}/api/collections/videos/records/$videoRecordId/view';
+
+      // Update the lobby with the video URL
+      await PocketBaseService.client
+          .collection('lobbies')
+          .update(_currentLobby!.id, body: {
+        'video_url': videoUrl,
+        'video_file_name': fileName,
+      });
+
+      // Update local state
+      _currentLobby = _currentLobby!.copyWith(
+        videoUrl: videoUrl,
+        videoFileName: fileName,
+      );
+
+      // Set up video player with the local file
+      _localVideoFile = videoFile;
+      await _initializeVideoPlayer(videoFile.path);
+
+      _status = LobbyStatus.videoReady;
+      notifyListeners();
+      return true;
     } catch (e) {
       _status = LobbyStatus.error;
       _errorMessage = 'Failed to upload video: ${e.toString()}';
@@ -403,9 +433,7 @@ class LobbyProvider extends ChangeNotifier {
     }
   }
 
-
-
-  // Download the video for participants
+  // Download the video for participants - CHUNKED implementation
   Future<void> _downloadVideo() async {
     if (_currentLobby?.videoUrl == null) {
       print('Download canceled: Video URL is null');
@@ -441,167 +469,139 @@ class LobbyProvider extends ChangeNotifier {
         }
       }
 
+      // Get video information first
+      // Extract video record ID from URL
+      final videoIdRegex = RegExp(r'videos/records/([^/]+)/');
+      final match = videoIdRegex.firstMatch(_currentLobby!.videoUrl!);
+
+      if (match == null) {
+        throw Exception('Could not extract video ID from URL: ${_currentLobby!.videoUrl}');
+      }
+
+      final videoId = match.group(1)!;
+
+      // Get video metadata
+      final videoMetadata = await PocketBaseService.client
+          .collection('videos')
+          .getOne(videoId);
+
+      final totalSize = videoMetadata.data['filesize'] as int;
+      final totalChunks = videoMetadata.data['total_chunks'] as int;
+
       // Initialize download progress
       _downloadProgress = FileTransferProgress(
         bytesTransferred: 0,
-        totalBytes: null, // Unknown initially
+        totalBytes: totalSize,
         speed: 0,
         lastUpdated: DateTime.now(),
       );
       notifyListeners();
 
+      // Tracking variables for speed calculation
+      int totalBytesDownloaded = 0;
+      final stopwatch = Stopwatch()..start();
+      int lastBytes = 0;
+      DateTime lastUpdateTime = DateTime.now();
+      double averageSpeed = 0;
+      const speedSmoothingFactor = 0.3;
+
+      // Create the output file
+      final outputFile = await file.create(recursive: true);
+      final outputSink = outputFile.openWrite();
+
       try {
-        final stopwatch = Stopwatch()..start();
-        print('Downloading video from PocketBase');
+        // Download each chunk
+        for (int i = 0; i < totalChunks; i++) {
+          // Get chunk record
+          final chunkResponse = await PocketBaseService.client
+              .collection('video_chunks')
+              .getList(filter: 'record_id="$videoId" && chunk_index=$i');
 
-        // Get the original video URL
-        String videoUrl = _currentLobby!.videoUrl!;
+          print('Looking for chunk $i, found ${chunkResponse.items.length} results');
 
-        // Modify URL for Android emulator if needed
-        if (Platform.isAndroid) {
-          // Parse the original URL
-          final uri = Uri.parse(videoUrl);
-
-          // Check if it's a localhost URL
-          if (uri.host == 'localhost' || uri.host == '127.0.0.1') {
-            // Create a new URL with 10.0.2.2 instead of localhost
-            final newUri = Uri(
-              scheme: uri.scheme,
-              host: '10.0.2.2',
-              port: uri.port,
-              path: uri.path,
-              query: uri.query,
-              fragment: uri.fragment,
-            );
-            videoUrl = newUri.toString();
-            print('Android detected, modified URL to: $videoUrl');
-          }
-        }
-
-        if (Platform.isWindows) {
-          // Parse the original URL
-          final uri = Uri.parse(videoUrl);
-
-          // Check if the URL is pointing to the Windows host (10.0.2.2)
-          if (uri.host == '10.0.2.2') {
-            // Create a new URL with localhost/127.0.0.1 instead
-            final newUri = Uri(
-              scheme: uri.scheme,
-              host: '127.0.0.1',  // or 'localhost'
-              port: uri.port,
-              path: uri.path,
-              query: uri.query,
-              fragment: uri.fragment,
-            );
-            videoUrl = newUri.toString();
-            print('Android detected, modified URL to: $videoUrl');
-          }
-        }
-
-        // Try to get file size via HEAD request first
-        int? totalSize;
-        try {
-          final headResponse = await http.head(Uri.parse(videoUrl));
-          if (headResponse.statusCode == 200) {
-            final contentLength = headResponse.headers['content-length'];
-            if (contentLength != null) {
-              totalSize = int.parse(contentLength);
-              print('File size from HEAD request: $totalSize bytes');
-
-              // Update progress with total size
-              _downloadProgress = FileTransferProgress(
-                bytesTransferred: 0,
-                totalBytes: totalSize,
-                speed: 0,
-                lastUpdated: DateTime.now(),
-              );
-              notifyListeners();
-            }
-          }
-        } catch (e) {
-          print('Failed to get file size via HEAD: $e');
-          // Continue without size
-        }
-
-        // Use an estimated size if not available
-        totalSize ??= 50 * 1024 * 1024;
-
-        // Set up progress simulation
-        _progressTimer?.cancel();
-
-        // Track download progress
-        int lastBytes = 0;
-        DateTime lastTime = DateTime.now();
-        int simulatedBytesDownloaded = 0;
-
-        // Update progress every 200ms
-        _progressTimer = Timer.periodic(Duration(milliseconds: 200), (timer) {
-          // Simulate download speed (around 2MB/s with some variation)
-          final bytesPerSecond = 2 * 1024 * 1024 * (0.8 + 0.4 * math.Random().nextDouble());
-          final bytesPerTick = (bytesPerSecond * 0.2).toInt(); // 200ms tick
-
-          simulatedBytesDownloaded += bytesPerTick;
-          if (simulatedBytesDownloaded > totalSize!) {
-            simulatedBytesDownloaded = totalSize;
-            // Don't cancel yet - wait for actual download to complete
+          if (chunkResponse.items.isEmpty) {
+            throw Exception('Chunk $i not found for video $videoId');
           }
 
-          // Calculate actual speed based on time difference
-          final now = DateTime.now();
-          final timeDiff = now.difference(lastTime).inMilliseconds / 1000.0;
-          final bytesAdded = simulatedBytesDownloaded - lastBytes;
-          final speed = timeDiff > 0 ? bytesAdded / timeDiff : 0;
+          // Download chunk
+          final chunkRecord = chunkResponse.items[0];
+          final chunkId = chunkRecord.id;
+
+          // Get the actual filename from the record
+          final chunkFileName = chunkRecord.data['chunk'] ?? 'chunk'; // Use the actual file field name
+
+          // Construct the correct PocketBase file URL - PocketBase expects:
+          // /api/files/{collectionName}/{recordId}/{fieldName}
+          final chunkUrl = '${PocketBaseService.baseUrl}/api/files/video_chunks/$chunkId/$chunkFileName';
+          print('Downloading chunk from: $chunkUrl');
+
+
+          final chunkResponse2 = await http.get(Uri.parse(chunkUrl));
+
+          if (chunkResponse2.statusCode != 200) {
+            print('Failed to download chunk $i. Status: ${chunkResponse2.statusCode}, Response: ${chunkResponse2.body}');
+            throw Exception('Failed to download chunk $i: HTTP ${chunkResponse2.statusCode}');
+          }
+
+          final chunkData = chunkResponse2.bodyBytes;
+
+          // Write chunk to file
+          outputSink.add(chunkData);
+
+          // Rest of your progress tracking code remains the same...
+
 
           // Update progress
+          totalBytesDownloaded += chunkData.length;
+          final now = DateTime.now();
+
+          // Calculate speed
+          final timeDiffSeconds = now.difference(lastUpdateTime).inMilliseconds / 1000.0;
+          final bytesSinceLast = totalBytesDownloaded - lastBytes;
+
+          if (timeDiffSeconds >= 0.1 && bytesSinceLast > 0) {
+            final instantSpeed = bytesSinceLast / timeDiffSeconds;
+            averageSpeed = averageSpeed == 0
+                ? instantSpeed
+                : averageSpeed * (1 - speedSmoothingFactor) + instantSpeed * speedSmoothingFactor;
+
+            lastBytes = totalBytesDownloaded;
+            lastUpdateTime = now;
+          }
+
+          // Update progress state
           _downloadProgress = FileTransferProgress(
-            bytesTransferred: simulatedBytesDownloaded,
+            bytesTransferred: totalBytesDownloaded,
             totalBytes: totalSize,
-            speed: speed,
+            speed: averageSpeed.isNaN || averageSpeed.isInfinite ? 0 : averageSpeed,
             lastUpdated: now,
           );
 
-          lastBytes = simulatedBytesDownloaded;
-          lastTime = now;
-
           notifyListeners();
-        });
-
-        // Perform the actual download
-        final response = await http.get(Uri.parse(videoUrl));
-        final bytes = response.bodyBytes;
-
-        // Cancel the progress timer
-        _progressTimer?.cancel();
-
-        print('Download completed in ${stopwatch.elapsedMilliseconds}ms');
-        print('Received ${bytes.length} bytes');
-
-        // Update with final progress
-        _downloadProgress = FileTransferProgress(
-          bytesTransferred: bytes.length,
-          totalBytes: bytes.length,
-          speed: bytes.length / (stopwatch.elapsedMilliseconds > 0 ? stopwatch.elapsedMilliseconds : 1) * 1000,
-          lastUpdated: DateTime.now(),
-        );
-        notifyListeners();
-
-        print('Writing file to disk');
-        await file.writeAsBytes(bytes);
-        print('File written successfully, size: ${bytes.length} bytes');
-
-        _localVideoFile = file;
-        print('Initializing video player with downloaded file');
-        await _initializeVideoPlayer(filePath);
-
-        _status = LobbyStatus.videoReady;
-        print('Video download and initialization completed in ${stopwatch.elapsedMilliseconds}ms');
-      } catch (e) {
-        _progressTimer?.cancel();
-        print('Error during download/write process: $e');
-        print('Error details: ${e.toString()}');
-        _status = LobbyStatus.error;
-        _errorMessage = 'Failed to download video: ${e.toString()}';
+        }
+      } finally {
+        await outputSink.flush();
+        await outputSink.close();
       }
+
+      print('Download completed in ${stopwatch.elapsedMilliseconds}ms');
+      print('Total bytes downloaded: $totalBytesDownloaded');
+
+      // Final progress update
+      _downloadProgress = FileTransferProgress(
+        bytesTransferred: totalBytesDownloaded,
+        totalBytes: totalBytesDownloaded,
+        speed: totalBytesDownloaded / (stopwatch.elapsedMilliseconds / 1000),
+        lastUpdated: DateTime.now(),
+      );
+      notifyListeners();
+
+      _localVideoFile = file;
+      print('Initializing video player with downloaded file');
+      await _initializeVideoPlayer(filePath);
+
+      _status = LobbyStatus.videoReady;
+      print('Video download and initialization completed');
       notifyListeners();
     } catch (e) {
       _progressTimer?.cancel();
@@ -612,7 +612,6 @@ class LobbyProvider extends ChangeNotifier {
       notifyListeners();
     }
   }
-
 
   // Initialize the video player
   Future<void> _initializeVideoPlayer(String filePath) async {

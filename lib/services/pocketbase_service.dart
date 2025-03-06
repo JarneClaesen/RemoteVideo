@@ -12,10 +12,6 @@ class PocketBaseService {
   static final _secureStorage = FlutterSecureStorage();
 
   static String getPlatformUrl(String url) {
-    if (!kIsWeb && Platform.isAndroid) {
-      // Replace localhost with 10.0.2.2 for Android
-      return url.replaceAll('localhost', '10.0.2.2');
-    }
     return url;
   }
 
@@ -46,11 +42,7 @@ class PocketBaseService {
   }
 
   static Future<void> initialize() async {
-    final String url = kIsWeb
-        ? 'http://localhost:8090'
-        : Platform.isWindows
-        ? 'http://localhost:8090'
-        : 'http://10.0.2.2:8090';
+    final String url = 'https://pocketbase.jarneclaesen.eu';
 
     _baseUrl = url;
 

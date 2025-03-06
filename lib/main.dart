@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
+import 'package:synced_video/theme/app_theme.dart';
 import 'package:video_player_media_kit/video_player_media_kit.dart';
 import 'services/pocketbase_service.dart';
 import 'providers/auth_provider.dart';
@@ -40,10 +41,8 @@ class MyApp extends StatelessWidget {
       ],
       child: MaterialApp(
         title: 'Video Sync App',
-        theme: ThemeData(
-          colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
-          useMaterial3: true,
-        ),
+        theme: AppTheme.lightTheme,
+        darkTheme: AppTheme.darkTheme,
         home: const AuthWrapper(),
       ),
     );
