@@ -12,6 +12,7 @@ import 'package:video_player/video_player.dart';
 import '../models/file_transfer_progress.dart';
 import '../models/lobby_model.dart';
 import '../services/pocketbase_service.dart';
+import 'package:dio/dio.dart' as dio;
 
 enum LobbyStatus {
   initial,
@@ -277,8 +278,6 @@ class LobbyProvider extends ChangeNotifier {
 
     try {
       _status = LobbyStatus.videoUploading;
-
-      // Get file size
       final fileSize = await videoFile.length();
 
       // Initialize progress
@@ -288,82 +287,87 @@ class LobbyProvider extends ChangeNotifier {
         speed: 0,
         lastUpdated: DateTime.now(),
       );
-
       notifyListeners();
 
-      // Set up progress simulation
-      _progressTimer?.cancel();
-
-      // Simulate upload progress
-      int lastBytes = 0;
-      DateTime lastTime = DateTime.now();
-      int simulatedBytesUploaded = 0;
-
-      // Update progress every 200ms
-      _progressTimer = Timer.periodic(Duration(milliseconds: 200), (timer) {
-        // Simulate upload speed (around 1MB/s with some variation)
-        final bytesPerSecond = 1024 * 1024 * (0.8 + 0.4 * math.Random().nextDouble());
-        final bytesPerTick = (bytesPerSecond * 0.2).toInt(); // 200ms tick
-
-        simulatedBytesUploaded += bytesPerTick;
-        if (simulatedBytesUploaded > fileSize) {
-          simulatedBytesUploaded = fileSize;
-        }
-
-        // Calculate actual speed based on time difference
-        final now = DateTime.now();
-        final timeDiff = now.difference(lastTime).inMilliseconds / 1000.0;
-        final bytesAdded = simulatedBytesUploaded - lastBytes;
-        final speed = timeDiff > 0 ? bytesAdded / timeDiff : 0;
-
-        // Update progress
-        _uploadProgress = FileTransferProgress(
-          bytesTransferred: simulatedBytesUploaded,
-          totalBytes: fileSize,
-          speed: speed,
-          lastUpdated: now,
-        );
-
-        lastBytes = simulatedBytesUploaded;
-        lastTime = now;
-
-        notifyListeners();
-      });
-
-      // Start the actual upload
       final baseName = path.basename(videoFile.path);
       final fileName = '${_currentLobby!.id}_$baseName';
+
+      // Create PocketBase FormData
+      final formData = dio.FormData.fromMap({
+        'lobby_id': _currentLobby!.id,
+        'filename': fileName,
+      });
+
+      // Add the file with progress tracking
+      final file = await dio.MultipartFile.fromFile(
+        videoFile.path,
+        filename: fileName,
+      );
+      formData.files.add(MapEntry('video', file));
+
+      // For speed calculation
       final stopwatch = Stopwatch()..start();
+      int initialBytes = 0;
+      int lastBytes = 0;
+      DateTime lastUpdateTime = DateTime.now();
+      double averageSpeed = 0;
+      const speedSmoothingFactor = 0.3; // For exponential moving average
 
-      try {
-        // Prepare form data for creating the record
-        final formData = {
-          'lobby_id': _currentLobby!.id,
-          'filename': fileName,
-        };
+      // Use Dio for upload with onSendProgress callback
+      final response = await dio.Dio().post(
+        '${PocketBaseService.baseUrl}/api/collections/videos/records',
+        data: formData,
+        options: dio.Options(
+          headers: {
+            'Authorization': 'Bearer ${PocketBaseService.client.authStore.token}',
+          },
+        ),
+        onSendProgress: (int sent, int total) {
+          final now = DateTime.now();
 
-        // Use the PocketBase SDK to create a record with the file
-        final record = await PocketBaseService.client
-            .collection('videos')
-            .create(
-          body: formData,
-          files: [
-            await http.MultipartFile.fromPath('video', videoFile.path, filename: fileName),
-          ],
-        );
+          // Calculate instantaneous speed
+          final timeDiffSeconds = now.difference(lastUpdateTime).inMilliseconds / 1000.0;
+          final bytesSinceLast = sent - lastBytes;
 
-        // Get the video record ID
-        final videoRecordId = record.id;
+          // Only update speed if enough time has passed (avoid division by very small numbers)
+          if (timeDiffSeconds >= 0.1 && bytesSinceLast > 0) {
+            final instantSpeed = bytesSinceLast / timeDiffSeconds;
 
-        // Extract the actual filename from the record data
-        // The field name might be 'video', change it according to your schema
-        final Map<String, dynamic> videoData = record.data;
+            // Exponential moving average for smoother speed
+            averageSpeed = averageSpeed == 0
+                ? instantSpeed
+                : averageSpeed * (1 - speedSmoothingFactor) + instantSpeed * speedSmoothingFactor;
 
-        // This is the critical part - get the actual stored filename
-        // The field name 'video' should be the name of the file field in your PocketBase collection
-        final String actualFileName = videoData['video'];
+            lastBytes = sent;
+            lastUpdateTime = now;
+          }
 
-        // Construct the proper URL manually
+          // If too much time passes without progress, calculate using overall average
+          if (now.difference(lastUpdateTime).inSeconds > 3 && sent > initialBytes) {
+            final totalElapsedSeconds = stopwatch.elapsedMilliseconds / 1000.0;
+            if (totalElapsedSeconds > 0) {
+              averageSpeed = (sent - initialBytes) / totalElapsedSeconds;
+            }
+          }
+
+          // Update progress state
+          _uploadProgress = FileTransferProgress(
+            bytesTransferred: sent,
+            totalBytes: total,
+            speed: averageSpeed.isNaN || averageSpeed.isInfinite ? 0 : averageSpeed,
+            lastUpdated: now,
+          );
+
+          notifyListeners();
+        },
+      );
+
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        final record = response.data;
+        final videoRecordId = record['id'];
+        final actualFileName = record['video'];
+
+        // Construct the video URL
         final videoUrl = '${PocketBaseService.baseUrl}/api/files/videos/$videoRecordId/$actualFileName';
 
         // Update the lobby with the video URL
@@ -384,33 +388,21 @@ class LobbyProvider extends ChangeNotifier {
         _localVideoFile = videoFile;
         await _initializeVideoPlayer(videoFile.path);
 
-        // Cancel the progress timer and set final progress
-        _progressTimer?.cancel();
-        _uploadProgress = FileTransferProgress(
-          bytesTransferred: fileSize,
-          totalBytes: fileSize,
-          speed: fileSize / (stopwatch.elapsedMilliseconds > 0 ? stopwatch.elapsedMilliseconds : 1) * 1000,
-          lastUpdated: DateTime.now(),
-        );
-
         _status = LobbyStatus.videoReady;
         notifyListeners();
         return true;
-      } catch (e) {
-        _progressTimer?.cancel();
-        _status = LobbyStatus.error;
-        _errorMessage = 'Failed to upload video: ${e.toString()}';
-        notifyListeners();
-        return false;
+      } else {
+        throw Exception('Failed to upload: HTTP ${response.statusCode}');
       }
+
     } catch (e) {
-      _progressTimer?.cancel();
       _status = LobbyStatus.error;
       _errorMessage = 'Failed to upload video: ${e.toString()}';
       notifyListeners();
       return false;
     }
   }
+
 
 
   // Download the video for participants
