@@ -657,18 +657,24 @@ class LobbyProvider extends ChangeNotifier {
     try {
       await _videoController!.play();
 
+      // Get position after play command
+      final newPosition = _videoController!.value.position.inMilliseconds;
+
       // Update the lobby state
       await PocketBaseService.client
           .collection('lobbies')
           .update(_currentLobby!.id, body: {
         'is_playing': true,
-        'video_position': _videoController!.value.position.inMilliseconds,
+        'video_position': newPosition,
       });
 
       _currentLobby = _currentLobby!.copyWith(
         isPlaying: true,
-        videoPosition: _videoController!.value.position.inMilliseconds,
+        videoPosition: newPosition,
       );
+
+      // Ensure synchronization after play attempt
+      await ensureVideoSync();
 
       notifyListeners();
     } catch (e) {
@@ -684,18 +690,24 @@ class LobbyProvider extends ChangeNotifier {
     try {
       await _videoController!.pause();
 
+      // Get position after pause
+      final currentPosition = _videoController!.value.position.inMilliseconds;
+
       // Update the lobby state
       await PocketBaseService.client
           .collection('lobbies')
           .update(_currentLobby!.id, body: {
         'is_playing': false,
-        'video_position': _videoController!.value.position.inMilliseconds,
+        'video_position': currentPosition,
       });
 
       _currentLobby = _currentLobby!.copyWith(
         isPlaying: false,
-        videoPosition: _videoController!.value.position.inMilliseconds,
+        videoPosition: currentPosition,
       );
+
+      // Ensure synchronization after pause
+      await ensureVideoSync();
 
       notifyListeners();
     } catch (e) {
@@ -794,5 +806,37 @@ class LobbyProvider extends ChangeNotifier {
         // Don't update UI on polling errors
       }
     });
+  }
+
+  Future<void> ensureVideoSync() async {
+    if (_videoController == null || _currentLobby == null) return;
+
+    // Wait a short delay for player to stabilize
+    await Future.delayed(Duration(milliseconds: 300));
+
+    final isPlaying = _currentLobby!.isPlaying;
+    final currentPosition = _videoController!.value.position.inMilliseconds;
+    final expectedPosition = _currentLobby!.videoPosition;
+
+    // Check if play state matches what's expected
+    if (isPlaying != _videoController!.value.isPlaying) {
+      print('Video play state out of sync. Expected: ${isPlaying ? 'playing' : 'paused'}, Actual: ${_videoController!.value.isPlaying ? 'playing' : 'paused'}');
+      if (isPlaying) {
+        await _videoController!.play();
+      } else {
+        await _videoController!.pause();
+      }
+    }
+
+    // Check position synchronization (if difference > 500ms)
+    if ((currentPosition - expectedPosition).abs() > 500) {
+      print('Video position out of sync. Current: $currentPosition, Expected: $expectedPosition');
+      await _videoController!.seekTo(Duration(milliseconds: expectedPosition));
+
+      // If should be playing, ensure playback continues after seek
+      if (isPlaying && !_videoController!.value.isPlaying) {
+        await _videoController!.play();
+      }
+    }
   }
 }
